@@ -7,7 +7,9 @@ from func_timeout import func_timeout, FunctionTimedOut
 from awsglue.utils import getResolvedOptions
 
 
-args = getResolvedOptions(sys.argv, ['region', 'database', 'tableName', 'athenaResultBucket', 'athenaResultFolder', 's3Bucket', 's3Folder'])
+args = getResolvedOptions(sys.argv, ['region', 'database', 'tableName', 'athenaResultBucket',
+                                     'athenaResultFolder', 's3Bucket', 's3Folder', 'timeout'])
+
 params = {
     'region': args['region'],
     'database': args['database'],
@@ -15,7 +17,7 @@ params = {
     'athenaResultBucket': args['athenaResultBucket'],
     'athenaResultFolder': args['athenaResultFolder'],
     's3Bucket': args['s3Bucket'],
-    's3Folder': args['s3Folder'],
+    's3Folder': args['s3Folder']+'/',
     'timeout': int(args['timeout'])  # in sec
 }
 print("Parameters : ")
@@ -90,15 +92,24 @@ def s3ListObject(s3, prefix):
         Delimiter='/',
         Prefix=prefix
     )
-    resultList.extend(result.get('CommonPrefixes'))
-    while (result['IsTruncated']):
-        result = s3.list_objects_v2(
-            Bucket=params['s3Bucket'],
-            Delimiter='/',
-            Prefix=prefix,
-            ContinuationToken=result['NextContinuationToken']
-        )
+    if result['KeyCount'] == 0:
+        return False
+    try:
         resultList.extend(result.get('CommonPrefixes'))
+        while (result['IsTruncated']):
+            result = s3.list_objects_v2(
+                Bucket=params['s3Bucket'],
+                Delimiter='/',
+                Prefix=prefix,
+                ContinuationToken=result['NextContinuationToken']
+            )
+            resultList.extend(result.get('CommonPrefixes'))
+    except Exception as e:
+        print("#~ FAILURE ~#")
+        print("Error with :")
+        print(result)
+        raise
+
     return resultList
 
 
@@ -112,7 +123,14 @@ def cleanup(s3Resource, params):
     print()
     # s3Resource.Bucket(params['athenaResultBucket']).delete()
 
+def split(l, n):
+    # For item i in a range that is a length of l,
+    for i in range(0, len(l), n):
+        # Create an index range for l of n items:
+        yield l[i:i+n]
 
+
+# MAIN EXECUTION BEGINS
 # Check if Bucket Exists
 s3CheckIfBucketExists(s3Resource, params["athenaResultBucket"])
 
@@ -151,59 +169,97 @@ print()
 # Parse S3 folder structure and create partition list
 prefix = params['s3Folder']
 yearFolders = s3ListObject(s3Client, prefix)
-monthList = []
-for year in yearFolders:
-    result = s3Client.list_objects_v2(
-        Bucket=params['s3Bucket'],
-        Delimiter='/',
-        Prefix=year.get('Prefix')
-    )
-    monthList.extend(result.get('CommonPrefixes'))
-s3List = []
-for thingType in monthList:
-    string = thingType.get('Prefix').replace(params['s3Folder'], "")
-    s3List.append(string.rstrip('/'))
-print("S3 Folder Structure At :")
-print(params['s3Bucket'] + '/' + params['s3Folder'])
-print("----------------------------------")
-print()
-print("S3 Partition List : ")
-print(s3List)
-print("----------------------------------")
-print()
+if yearFolders:
+    monthList = []
+    for year in yearFolders:
+        result = s3Client.list_objects_v2(
+            Bucket=params['s3Bucket'],
+            Delimiter='/',
+            Prefix=year.get('Prefix')
+        )
+        try:
+            monthList.extend(result.get('CommonPrefixes'))
+        except Exception as e:
+            print("#~ FAILURE ~#")
+            print("Error with :")
+            print(result)
+            raise
 
+    s3List = []
+    for thingType in monthList:
+        string = thingType.get('Prefix').replace(params['s3Folder'], "")
+        s3List.append(string.rstrip('/'))
 
-# Compare Athena Partition List with S3 Partition List
-resultSet = set(s3List) - set(athenaList)
-print("Result Set : ")
-print(resultSet)
-print("----------------------------------")
-print()
+    # To filter out default spark null partitions and folders like  _SUCCESS, _temporary, __HIVE_DEFAULT_PARTITION__
+    s3List = [i for i in s3List if (('month' in i) and (i.startswith('year')) and not ('__HIVE_DEFAULT_PARTITION__' in i))]
 
-
-# Create Alter Query for Athena
-if len(resultSet) != 0:
-    queryString = "ALTER TABLE " + params['tableName'] + " ADD IF NOT EXISTS PARTITION(" + repr(resultSet) + ")"
-    queryString = queryString.replace("{", "")
-    queryString = queryString.replace("}", "")
-    queryString = queryString.replace(",", ") PARTITION(")
-    queryString = queryString.replace("'", "")
-    queryString = queryString.replace("date=", "date='")
-    queryString = queryString.replace("/", "', ")
-    print("Alter Query String : ")
-    print(queryString)
+    print("S3 Folder Structure At :")
+    print(params['s3Bucket'] + '/' + params['s3Folder'])
     print("----------------------------------")
     print()
-    # Run Alter Partition Query
-    execution = athena_query(athenaClient, queryString)
-    if execution['ResponseMetadata']['HTTPStatusCode'] == 200:
-        # Temp Folder Cleanup
-        cleanup(s3Resource, params)
-        print("*~ SUCCESS ~*")
-    else:
-        print("#~ FAILURE ~#")
+    print("S3 Partition List : ")
+    print(s3List)
+    print("----------------------------------")
+    print()
+
+
+    # Compare Athena Partition List with S3 Partition List
+    resultSet = set(s3List) - set(athenaList)
+    print("Result Set : ")
+    print(resultSet)
+    print("----------------------------------")
+    print()
+
+
+    # Create Alter Query for Athena
+    try:
+        if len(resultSet) != 0:
+            print("Partition Count : " + str(len(resultSet)))
+            result = split(list(resultSet), 1000)
+            for resultSet in result:
+                queryString = "ALTER TABLE " + params['tableName'] + " ADD IF NOT EXISTS PARTITION(" + repr(resultSet) + ")"
+                queryString = queryString.replace("[", "")
+                queryString = queryString.replace("]", "")
+                queryString = queryString.replace("{", "")
+                queryString = queryString.replace("}", "")
+                queryString = queryString.replace(",", ") PARTITION(")
+                queryString = queryString.replace("'", "")
+                queryString = queryString.replace("date=", "date='")
+                queryString = queryString.replace("/", "', ")
+                print("Alter Query String : ")
+                print(queryString)
+                print("----------------------------------")
+                print()
+
+                # Run Alter Partition Query
+                execution = athena_query(athenaClient, queryString)
+                if execution['ResponseMetadata']['HTTPStatusCode'] == 200:
+                    # Temp Folder Cleanup
+                    cleanup(s3Resource, params)
+                    print("*~ SUCCESS ~*")
+                    print()
+                else:
+                    print("#~ FAILURE ~#")
+                    print()
+
+        else:
+            # Temp Folder Cleanup
+            cleanup(s3Resource, params)
+            print()
+            print("*~ SUCCESS ~*")
+
+    except Exception as e:
+            # Temp Folder Cleanup
+            cleanup(s3Resource, params)
+            print("#~ FAILURE ~#")
+            print("Error with :")
+            print(resultSet)
+            print(e)
+            raise
 else:
     # Temp Folder Cleanup
     cleanup(s3Resource, params)
+    print("S3 Folder does not exist.")
+    print("----------------------------------")
     print()
-    print("*~ SUCCESS ~*")
+    print("#~ FAILURE ~#")
